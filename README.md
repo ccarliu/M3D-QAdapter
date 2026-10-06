@@ -1,9 +1,8 @@
-# M3D-QAdapter — 预训练代码（独立可运行）
+# M3D-QAdapter — 预训练代码
 
 > **对应论文**：*M3D-QAdapter: 3D Medical VQA with Lesion-Level Finding-Segmentation
 > Alignment and Query-Driven Adaptive Token Reduction*
 >
-> 本仓库是从 `M3AE-master/CTRG_code/main_3D.py` 剥离出来的**论文预训练阶段（Stage-1）
 > 独立可运行实现**：CT-RATE 3D CT 报告预训练，包含论文两个核心机制 ——
 > **病灶级 finding–分割对齐（Lesion-Level Finding-Segmentation Alignment）** 与
 > **查询驱动的自适应 token 缩减（Query-Driven Adaptive Token Reduction）**。
@@ -152,38 +151,6 @@ CUDA_VISIBLE_DEVICES=0 python main_3D.py with task_pretrain_m3ae_3D \
 - `num_expert` / `topk_struct`：查询驱动 token 缩减的结构超参
 - `strategy=auto` 单卡/CPU 调试用；多卡默认 `ddp_find_unused_parameters_true`
 
-## 6. 相对原仓库的改动
-
-1. **裁剪 import 爆炸**：`CTRG/modules/__init__.py` 置空（原文件 import 100+ 个 trainer，
-   会拉入 peft/trl 等全栈依赖）；`datasets/__init__.py`、`datamodules/__init__.py`
-   只保留用到的类；`gloria_loss/__init__.py` 置空；数据集文件删掉
-   Deeptumor / pillar / VQAdataset 等未使用类（3347 → 2059 行）。
-2. **去 `generation_api`**：`gadgets/my_metrics.py` 不再 import
-   `generation_api.metrics`（pycocoevalcap + jar），改为文件内纯 Python 实现的
-   `compute_scores`（BLEU-1..4 + ROUGE-L；METEOR/CIDER 记 0，预训练任务不用）。
-3. **路径全部可配置**：模型里写死的 `BiomedVLP_cxr_bert`、数据集里写死的
-   `json_path` / `abnormality_text_embedding_path` / `normalized_label_path_*` /
-   mask 路径 / `store_path` 跳过逻辑，全部改为 config 项（带环境变量回退）。
-   模型初始化时读的 `./text_latent_feature.npz` 改为 `text_latent_feature_path`。
-4. **`main_3D.py` 瘦身**：删掉 7 个未使用的模型 import、`if False:` 里的硬编码
-   `/jizhicfs` 分支；`max_epochs=20`、`grad_steps//grad_steps` 等调试残留改为
-   `max_epoch_cap` / 正常计算；`test_only` 分支的硬编码 ckpt 改为 `test_ckpt_path`。
-5. **健壮性修复**（不改算法语义）：
-   - `infer()` 里 `batch["lesion_mask"]` 改为 `batch.get(...)`，且只在 mask 是
-     `(b,d,h,w)` 4 维张量时进入病灶对齐分支 —— 原代码在 qwen 数据集（无 lesion_mask）
-     上直接 KeyError，在 `with_lesion=False` 时因 `lesion_mask=1` 触发 unpack 报错。
-   - 数据集病灶分支由 `if False:` 改为 `if config.get("with_lesion", False):`，
-     使论文的 Lesion-Level Alignment 可以按需开启。
-6. `ct_clip` 未 vendor 进仓库，按需求写在 `requirements.txt` 里（本地 editable 安装）。
-
-## 7. 已验证
-
-在 V100 × 1 与 V100 × 2 上，`fast_dev_run=True`、`per_gpu_batchsize=2` 均可完整跑通
-1 个 train batch + 1 个 val batch（模型 456M 参数，347M 可训练）并正常结束。
-
-已知约束：**`per_gpu_batchsize` 必须 ≥ 2**。动量队列更新
-`_dequeue_and_enqueue2` 里 `sim.squeeze()` 在 batch=1 时会把 `(1,10,1)` 压成 `(10,)`，
-导致 `sim[:, idx]` 越界；这是原实现就有的边界问题，未改动。
 
 ## 8. 引用
 
