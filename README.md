@@ -1,77 +1,55 @@
-# M3D-QAdapter — 预训练代码
+# M3D-QAdapter — 预训练 + VQA 微调代码
 
 > **对应论文**：*M3D-QAdapter: 3D Medical VQA with Lesion-Level Finding-Segmentation
 > Alignment and Query-Driven Adaptive Token Reduction*
 >
-> 独立可运行实现**：CT-RATE 3D CT 报告预训练，包含论文两个核心机制 ——
+> 包含论文两个核心机制 ——
 > **病灶级 finding–分割对齐（Lesion-Level Finding-Segmentation Alignment）** 与
 > **查询驱动的自适应 token 缩减（Query-Driven Adaptive Token Reduction）**。
 
-- 训练入口：`main_3D.py`（sacred，named config `task_pretrain_m3ae_3D`）
-- 预训练模型：`CTRG.modules.report_generation_pretrain_v29_textemb_perorgan_mask_lesion`
-  （`CTRG_pretrain_v29_textemb_perorgan_mask_lesion`）
+**Stage-1 预训练**
+- 入口：`main_3D.py`（sacred，named config `task_pretrain_m3ae_3D`）
+- 模型：`CTRG_pretrain_v29_textemb_perorgan_mask_lesion`
 - 视觉编码：CTViT（`ctvit/`，patch 30×30、temporal patch 15 → 输入 240×480×480）
 - 文本编码：CXR-BERT（`text_encoder_path`）+ 报告文本 embedding
 - 数据：CT-RATE（`MedicatDataModule_3D_RATE_hr*`）
 
-> 说明：论文的 **3D Medical VQA 微调/推理**部分在原仓库的 VQA / set-prediction / GRPO
-> 系列 trainer 中，不在本仓库范围内（本仓库只保留预训练链路及其依赖）。
+**Stage-2 VQA 微调**
+- 入口：`main_report_gen_vqa.py`（sacred，named config `task_finetune_vqa`）
+- 模型：`CTRG_3D_lmae_vqa_v18`（冻结 Stage-1 的 query experts，经**问题引导的
+  Masked-FPS token 缩减**后接 LLM 解码器，LoRA 微调）
+- LLM 解码器：默认 Llama-3.2-3B（`decoder_path`，可换 Qwen3-4B 等，需对应 `llm_dim`）
+- 数据：CT-RATE VQA（`MedicatDataModule_3D_RATE_hr_fea_vqa` → `VQAdataset`，
+  Stage-1 预提取的 `image_feature`(4096×768) / `selected_patch` + 16³ 器官 mask）
+- 另有备选模型 `CTRG_3D_lmae_vqa_v20_qwen`（用 Qwen3-VL 空间特征 + `OrganFeatureRefiner`），
+  文件保留但入口默认使用 v18。
 
 ---
 
-## 1. 论文贡献 → 代码映射
-
-### 1.1 Lesion-Level Finding-Segmentation Alignment（病灶级 finding–分割对齐）
-
-把 ReXGroundingCT 的**病灶分割 mask**与**对应 finding 的文本描述**在视觉 token 网格上
-做稀疏对齐监督，使每个病灶区域的特征与其 finding 文本 embedding 对齐。
-
-| 论文字段 | 代码位置 |
-|---|---|
-| 病灶 mask + finding 文本读取 | `CTRG/datasets/pretraining_ctrg_dataset.py::CTRGDataset_RATE_hr_sim.get_lesion_mask()`（读 `lesion_mask_path/*.npz` 与 `lesion_mask_json`，多通道 mask 压成 `final_lesion_mask`，同时取该例 `findings` 作为 `text_query`） |
-| mask 与视觉 token 网格对齐 | `..._lesion.py::infer()`：把 `lesion_mask` reshape 成 `d//15, h//30, w//30` → 16×16×16 patch 网格，`cmask >= 10` 作为正样本 |
-| finding 文本编码 | `..._lesion.py::infer_text__()`（`self.text_model` + `tokenizer_text_enc`，参数冻结） |
-| 对齐损失 | `..._lesion.py::SparseAlignLoss / SparseAlignLossBaseline`（`self.lesion_align`）：可学习投影 + 可学习 logit scale + sigmoid，pos/neg BCE + safe-negative mining（忽略 prob>0.8 的疑似漏标背景）；另有 `sparse_mask_alignment_loss()` |
-| 病灶条件化融合 | `..._lesion.py::self.leision_pre`（1 层 `BertCrossLayer`）与 `infer_image()` 中的 `lesion_loss` |
-| 总损失 | `infer_image()`：`loss = sparse_negative_entropy_loss(attn, cmask) + pointwise_cross_entropy_loss(organ_pred, cmask) + lesion_align(...)` |
-| 开关 | `with_lesion=True`（默认 False，与原快照一致）+ `lesion_mask_path` / `lesion_mask_json` |
-
-### 1.2 Query-Driven Adaptive Token Reduction（查询驱动的自适应 token 缩减）
-
-用一小组**可学习 query（expert token）**与全量视觉 token 做双向 cross-attention，
-按 attention 排序只保留每个 query 最相关的少数 token，从而把 3D CT 的海量 patch token
-压缩成极小的 token 集合再送入后续模块。
-
-| 论文字段 | 代码位置 |
-|---|---|
-| 可学习 query / expert token | `self.expert_image`、`self.expert_text`（`nn.Embedding(num_expert=10, 768)`，`num_expert=10`） |
-| Query ↔ token 双向 cross-attention | `self.vision_extract_layer`（2 层 `BertCrossLayer`，`infer_image()` 中 `extract_layer(x, y)` / `extract_layer(y, x)`） |
-| Attention 引导的 token 选择 | `infer_image()`：`torch.sort(attention_map, 2)` → 每个 expert 取 top-9（`selected_index[ii, expert_i, -9:]`），拼成 `selected_patch`，再拼回 expert token `x`：4096 patch token → 10×(9+1) 个 token |
-| 稀疏性 / 器官监督 | `sparse_negative_entropy_loss(attention_map[:, :9], cmask[:, :9])`（器官 mask 约束 expert attention）、`self.organ_cls` + `pointwise_cross_entropy_loss` |
-| 结构超参 | `num_expert=10`、`topk_struct`（config）、`hidden_size=768` |
-| 队列式对比学习 | `text_queue` / `text_queue_sim`（10000×512 动量队列）、`_dequeue_and_enqueue2()`、`sim_i2t_targets` 软目标 |
-| 注意力图输出 | `infer_image()` 返回 `attention_map = x_attention[1].mean(1)`，可用于病灶/器官可视化 |
-
----
-
-## 2. 目录结构
+## 1. 目录结构
 
 ```
 CTRG_pretrain_standalone/
-├── main_3D.py                     # 训练入口（sacred automain）
-├── text_latent_feature.npz        # 模型初始化时加载的缓存文本特征
-├── run_pretrain.sh                # 启动脚本
+├── main_3D.py                     # Stage-1 预训练入口（sacred automain）
+├── main_report_gen_vqa.py         # Stage-2 VQA 微调入口（sacred automain）
+├── text_latent_feature.npz        # 预训练模型初始化时加载的缓存文本特征
+├── run_pretrain.sh                # Stage-1 启动脚本
+├── run_vqa.sh                     # Stage-2 启动脚本
 ├── requirements.txt
 ├── ctvit/                         # CTViT（本地包，原仓库根目录下）
 │   ├── ctvit.py  attention.py
 └── CTRG/
     ├── config.py                  # sacred 配置（所有路径支持环境变量/CLI 覆盖）
     ├── datamodules/               # base_datamodule + pretraining_medicat_datamodule
-    ├── datasets/                  # pretraining_ctrg_dataset + data_loader
+    ├── datasets/                  # pretraining_ctrg_dataset（含 VQAdataset*）+ data_loader
     ├── transforms/                # clip transform / randaug
     ├── gadgets/my_metrics.py      # torchmetrics 指标（BLEU 已本地化，见下）
     └── modules/
-        ├── report_generation_pretrain_v29_textemb_perorgan_mask_lesion.py   # 预训练模型（论文 Stage-1）
+        ├── report_generation_pretrain_v29_textemb_perorgan_mask_lesion.py   # Stage-1 预训练模型
+        ├── report_generation_vqa_v18.py        # Stage-2 VQA 模型（CTRG_3D_lmae_vqa_v18，当前使用）
+        ├── report_generation_vqa_v20_qwen.py   # Stage-2 VQA 备选模型（qwen 特征 + OrganFeatureRefiner）
+        ├── patch_selection.py                  # 查询驱动 token 缩减的 token 选择器（FPS/pooling）
+        ├── organ_qformer.py                    # OrganFeatureRefiner（送入 LLM 前的 query 适配）
         ├── objectives.py  m3ae_utils.py  dist_utils.py  online_utils.py
         ├── language_encoders/bert_model.py     # BertCrossLayer（token reduction 用）
         ├── models/med.py                       # BertLMHeadModel
@@ -79,11 +57,13 @@ CTRG_pretrain_standalone/
         └── gloria_loss/gloria_loss.py
 ```
 
-未拷贝（与预训练无关）：`CTRG/eval`、`CTRG/generation_api`（pycocoevalcap + 20 个 jar）、
-`modules/` 下 150+ 个 VQA / set-prediction / GRPO trainer、`datasets/set_prediction_dataset*.py`、
-`set_prediction` 相关配置。
+未拷贝（与本仓库两阶段无关）：`CTRG/eval`、`CTRG/generation_api`（pycocoevalcap + 20 个 jar）、
+`modules/` 下其余 140+ 个 VQA 变体 / set-prediction / GRPO trainer、
+`datasets/set_prediction_dataset*.py`、`set_prediction` 相关配置。
+（原 `main_report_gen_vqa.py` import 的 v12~v31 等模型均未实际使用，只保留实际用到的
+`CTRG_3D_lmae_vqa_v20_qwen`。）
 
-## 3. 安装
+## 2. 安装
 
 ```bash
 pip install -r requirements.txt
@@ -95,31 +75,10 @@ pip install -e /apdcephfs_cq10/share_1290796/lh/M3AE-master/CT-CLIP-main/CT_CLIP
 python -c "import nltk; nltk.download('punkt')"
 ```
 
-## 4. 路径配置
 
-`CTRG/config.py` 里所有数据/权重路径都可以用**环境变量**或 **sacred CLI** 覆盖
-（`with text_path_train=/xxx` 优先级最高）。默认值是原机器上的路径，仅作参考。
+## 3. 运行
 
-| 环境变量 | 配置项 | 说明 |
-|---|---|---|
-| `CTRG_TEXT_MODEL` | `text_model` | BERT config 目录 |
-| `CTRG_TEXT_ENCODER_PATH` | `text_encoder_path` | 报告文本编码器（CXR-BERT 目录） |
-| `CTRG_TOKENIZER_PATH` | `text_tokenlizer_path` | BertTokenizer 目录 |
-| `CTRG_CT_CLIP_CKPT` | `ct_clip_ckpoint` | CT_CLIP_zeroshot.pt（加载 visual/text transformer 权重） |
-| `CTRG_TEXT_PATH_TRAIN/TEST` | `text_path_*` | 报告 csv |
-| `CTRG_LABEL_PATH_TRAIN/TEST` | `label_path_*` | 多异常标签 csv |
-| `CTRG_IMAGE_PATH_TRAIN/TEST` | `image_path_*` | 预处理后的 CT volume（.npz） |
-| `CTRG_TEXT_EMB_TRAIN/TEST` | `text_emb_path_*` | `*.npz_text_feature.npy` |
-| `CTRG_MASK_TRAIN/TEST` | `mask_path_*` | 器官 mask |
-| `CTRG_MASK_FAST_TRAIN/TEST` | `mask_fast_path_*` | fast 器官 mask（.npy） |
-| `CTRG_IMGFEA_TRAIN/TEST` | `imgfea_path_*` | 预提取图像特征（qwen dm 用） |
-| `CTRG_ABN_TEXT_EMB` | `abnormality_text_embedding_path` | 每例异常文本 embedding |
-| `CTRG_NORMALIZED_LABEL_TRAIN/VAL` | `normalized_label_path_*` | region-report csv |
-| `CTRG_JSON_PATH_TRAIN/TEST` | `json_path_*` | report hierarchy tree |
-| `CTRG_LESION_MASK_PATH/JSON` | `lesion_mask_*` | **ReXGroundingCT 病灶 mask（论文病灶对齐用，见 §1.1）** |
-| `CTRG_TEXT_LATENT_FEATURE` | `text_latent_feature_path` | `text_latent_feature.npz` |
-
-## 5. 运行
+### 3.1 Stage-1 预训练
 
 ```bash
 # 3 卡训练
@@ -150,6 +109,32 @@ CUDA_VISIBLE_DEVICES=0 python main_3D.py with task_pretrain_m3ae_3D \
 - `with_lesion=True` 打开病灶对齐分支（需要 ReXGroundingCT mask），默认关闭（与原快照一致）
 - `num_expert` / `topk_struct`：查询驱动 token 缩减的结构超参
 - `strategy=auto` 单卡/CPU 调试用；多卡默认 `ddp_find_unused_parameters_true`
+
+### 3.2 Stage-2 VQA 微调
+
+```bash
+# 启动脚本（指定 Stage-1 预训练 ckpt）
+PRETRAIN_CKPT=/path/to/stage1_pretrain.ckpt bash run_vqa.sh
+
+# 等价命令
+CUDA_VISIBLE_DEVICES=0 python main_report_gen_vqa.py \
+    with task_finetune_vqa \
+    num_gpus=1 num_nodes=1 test_only=False \
+    pretrain_path=/path/to/stage1_pretrain.ckpt
+
+# 冒烟测试（1 卡 1 batch，strategy=auto）
+CUDA_VISIBLE_DEVICES=0 python main_report_gen_vqa.py with task_finetune_vqa \
+    num_gpus=1 fast_dev_run=True strategy=auto
+```
+
+VQA 常用开关：
+
+- `pretrain_path=<ckpt>` 加载 Stage-1 预训练编码器（非 strict；强烈建议）
+- `test_only=True test_ckpt_path=<vqa_ckpt>` 用微调后的 VQA ckpt 测试
+- `decoder_path=/path/to/LLM text_tokenlizer_path=/path/to/LLM llm_dim=<dim>` 换 LLM 解码器
+  （默认 Qwen3-4B / `llm_dim=2560`，需 `transformers>=4.50`）
+- `selected_patch=9` 每器官保留的 token 数（查询驱动 token 缩减强度）
+- 冻结项：代码自动冻结 `vision_encoder` 与 `expert`（Stage-1 的 CTViT + query experts）
 
 
 ## 8. 引用

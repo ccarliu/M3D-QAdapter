@@ -2,7 +2,9 @@
 torch>=2.0.1
 torchvision>=0.15.2
 pytorch_lightning>=2.0.0
-transformers>=4.30.0,<5.0.0
+# NOTE: the VQA fine-tuning decoder is Qwen3-4B, which requires transformers>=4.50.
+# Pretraining alone works with >=4.30, but keep >=4.50 for the full pipeline.
+transformers>=4.50.0,<5.0.0
 numpy>=1.24
 Pillow>=9.5
 
@@ -12,6 +14,9 @@ positional_encodings>=6.0.3
 vector_quantize_pytorch>=1.1.2
 beartype>=0.22
 torchmetrics>=0.11
+# VQA fine-tuning: LoRA on the LLM decoder + attention-map visualisation
+peft>=0.10.0
+matplotlib>=3.5
 
 # ── Config / logging ──
 sacred>=0.8.4
