@@ -1,153 +1,114 @@
-# M3D-QAdapter — 预训练 + VQA 微调代码
+M3D-QAdapter — Pretraining + VQA Finetuning Code
+Paper: M3D-QAdapter: 3D Medical VQA with Lesion-Level Finding-Segmentation Alignment and Query-Driven Adaptive Token Reduction
 
-> **对应论文**：*M3D-QAdapter: 3D Medical VQA with Lesion-Level Finding-Segmentation
-> Alignment and Query-Driven Adaptive Token Reduction*
->
-> 包含论文两个核心机制 ——
-> **病灶级 finding–分割对齐（Lesion-Level Finding-Segmentation Alignment）** 与
-> **查询驱动的自适应 token 缩减（Query-Driven Adaptive Token Reduction）**。
+This repository contains the paper's two core mechanisms: Lesion-Level Finding-Segmentation Alignment and Query-Driven Adaptive Token Reduction.
 
-**Stage-1 预训练**
-- 入口：`main_3D.py`（sacred，named config `task_pretrain_m3ae_3D`）
-- 模型：`CTRG_pretrain_v29_textemb_perorgan_mask_lesion`
-- 视觉编码：CTViT（`ctvit/`，patch 30×30、temporal patch 15 → 输入 240×480×480）
-- 文本编码：CXR-BERT（`text_encoder_path`）+ 报告文本 embedding
-- 数据：CT-RATE（`MedicatDataModule_3D_RATE_hr*`）
+Stage-1 pretraining
 
-**Stage-2 VQA 微调**
-- 入口：`main_report_gen_vqa.py`（sacred，named config `task_finetune_vqa`）
-- 模型：`CTRG_3D_lmae_vqa_v18`（冻结 Stage-1 的 query experts，经**问题引导的
-  Masked-FPS token 缩减**后接 LLM 解码器，LoRA 微调）
-- LLM 解码器：默认 Llama-3.2-3B（`decoder_path`，可换 Qwen3-4B 等，需对应 `llm_dim`）
-- 数据：CT-RATE VQA（`MedicatDataModule_3D_RATE_hr_fea_vqa` → `VQAdataset`，
-  Stage-1 预提取的 `image_feature`(4096×768) / `selected_patch` + 16³ 器官 mask）
-- 另有备选模型 `CTRG_3D_lmae_vqa_v20_qwen`（用 Qwen3-VL 空间特征 + `OrganFeatureRefiner`），
-  文件保留但入口默认使用 v18。
+Entry point: main_3D.py (sacred, named config task_pretrain_m3ae_3D)
+Model: CTRG_pretrain_v29_textemb_perorgan_mask_lesion
+Vision encoder: CTViT (ctvit/, patch 30×30, temporal patch 15 → input 240×480×480)
+Text encoder: CXR-BERT (text_encoder_path) + report text embeddings
+Data: CT-RATE (MedicatDataModule_3D_RATE_hr*)
+Stage-2 VQA finetuning
 
----
-
-## 1. 目录结构
-
-```
+Entry point: main_report_gen_vqa.py (sacred, named config task_finetune_vqa)
+Model: CTRG_3D_lmae_vqa_v18 (freezes the Stage-1 query experts, applies question-guided Masked-FPS token reduction, then feeds an LLM decoder finetuned with LoRA)
+LLM decoder: Llama-3.2-3B by default (decoder_path; can be replaced with e.g. Qwen3-4B, with the matching llm_dim)
+Data: CT-RATE VQA (MedicatDataModule_3D_RATE_hr_fea_vqa → VQAdataset, using the Stage-1 pre-extracted image_feature (4096×768) / selected_patch + 16³ organ masks)
+An alternative model, CTRG_3D_lmae_vqa_v20_qwen (Qwen3-VL spatial features + OrganFeatureRefiner), is kept in the repo, but the entry point uses v18 by default.
+1. Layout
 CTRG_pretrain_standalone/
-├── main_3D.py                     # Stage-1 预训练入口（sacred automain）
-├── main_report_gen_vqa.py         # Stage-2 VQA 微调入口（sacred automain）
-├── text_latent_feature.npz        # 预训练模型初始化时加载的缓存文本特征
-├── run_pretrain.sh                # Stage-1 启动脚本
-├── run_vqa.sh                     # Stage-2 启动脚本
+├── main_3D.py                     # Stage-1 pretraining entry point (sacred automain)
+├── main_report_gen_vqa.py         # Stage-2 VQA finetuning entry point (sacred automain)
+├── text_latent_feature.npz        # cached text features loaded when the pretraining model is initialized
+├── run_pretrain.sh                # Stage-1 launch script
+├── run_vqa.sh                     # Stage-2 launch script
 ├── requirements.txt
-├── ctvit/                         # CTViT（本地包，原仓库根目录下）
+├── ctvit/                         # CTViT (local package, originally at the root of the source repo)
 │   ├── ctvit.py  attention.py
 └── CTRG/
-    ├── config.py                  # sacred 配置（所有路径支持环境变量/CLI 覆盖）
+    ├── config.py                  # sacred config (all paths can be overridden via env vars / CLI)
     ├── datamodules/               # base_datamodule + pretraining_medicat_datamodule
-    ├── datasets/                  # pretraining_ctrg_dataset（含 VQAdataset*）+ data_loader
+    ├── datasets/                  # pretraining_ctrg_dataset (incl. VQAdataset*) + data_loader
     ├── transforms/                # clip transform / randaug
-    ├── gadgets/my_metrics.py      # torchmetrics 指标（BLEU 已本地化，见下）
+    ├── gadgets/my_metrics.py      # torchmetrics metrics (BLEU implemented locally, see below)
     └── modules/
-        ├── report_generation_pretrain_v29_textemb_perorgan_mask_lesion.py   # Stage-1 预训练模型
-        ├── report_generation_vqa_v18.py        # Stage-2 VQA 模型（CTRG_3D_lmae_vqa_v18，当前使用）
-        ├── report_generation_vqa_v20_qwen.py   # Stage-2 VQA 备选模型（qwen 特征 + OrganFeatureRefiner）
-        ├── patch_selection.py                  # 查询驱动 token 缩减的 token 选择器（FPS/pooling）
-        ├── organ_qformer.py                    # OrganFeatureRefiner（送入 LLM 前的 query 适配）
+        ├── report_generation_pretrain_v29_textemb_perorgan_mask_lesion.py   # Stage-1 pretraining model
+        ├── report_generation_vqa_v18.py        # Stage-2 VQA model (CTRG_3D_lmae_vqa_v18, in use)
+        ├── report_generation_vqa_v20_qwen.py   # Stage-2 alternative VQA model (Qwen features + OrganFeatureRefiner)
+        ├── patch_selection.py                  # token selector for query-driven token reduction (FPS / pooling)
+        ├── organ_qformer.py                    # OrganFeatureRefiner (query adaptation before the LLM)
         ├── objectives.py  m3ae_utils.py  dist_utils.py  online_utils.py
-        ├── language_encoders/bert_model.py     # BertCrossLayer（token reduction 用）
+        ├── language_encoders/bert_model.py     # BertCrossLayer (used for token reduction)
         ├── models/med.py                       # BertLMHeadModel
         ├── RadFM/vit_3d.py, position_encoding.py
         └── gloria_loss/gloria_loss.py
-```
+Not copied (unrelated to the two stages of this repo): CTRG/eval, CTRG/generation_api (pycocoevalcap + 20 jars), the other 140+ VQA variants / set-prediction / GRPO trainers under modules/, datasets/set_prediction_dataset*.py, and the set_prediction configs. (The v12–v31 models imported by the original main_report_gen_vqa.py were never actually used; only CTRG_3D_lmae_vqa_v20_qwen, which is used, is kept.)
 
-未拷贝（与本仓库两阶段无关）：`CTRG/eval`、`CTRG/generation_api`（pycocoevalcap + 20 个 jar）、
-`modules/` 下其余 140+ 个 VQA 变体 / set-prediction / GRPO trainer、
-`datasets/set_prediction_dataset*.py`、`set_prediction` 相关配置。
-（原 `main_report_gen_vqa.py` import 的 v12~v31 等模型均未实际使用，只保留实际用到的
-`CTRG_3D_lmae_vqa_v20_qwen`。）
-
-## 2. 安装
-
-```bash
+2. Installation
 pip install -r requirements.txt
 
-# ct_clip 不在 PyPI 上，从 CT-CLIP 源码树安装（--no-deps 避免拉入 wilds 等无关依赖）
+# ct_clip is not on PyPI; install it from the CT-CLIP source tree
+# (--no-deps avoids pulling in unrelated dependencies such as wilds)
 pip install -e /apdcephfs_cq10/share_1290796/lh/M3AE-master/CT-CLIP-main/CT_CLIP --no-deps
 
-# nltk 分词数据（数据集里用到 sent_tokenize）
+# nltk tokenizer data (the dataset uses sent_tokenize)
 python -c "import nltk; nltk.download('punkt')"
-```
-
-
-## 3. 运行
-
-### 3.1 Stage-1 预训练
-
-```bash
-# 3 卡训练
+3. Running
+3.1 Stage-1 pretraining
+# 3-GPU training
 bash run_pretrain.sh
 
-# 等价命令
+# Equivalent command
 CUDA_VISIBLE_DEVICES=0,1,2 python main_3D.py \
     with task_pretrain_m3ae_3D \
     num_gpus=3 num_nodes=1 per_gpu_batchsize=2 test_only=False
 
-# 打开论文的病灶级 finding–分割对齐分支
+# Enable the paper's lesion-level finding-segmentation alignment branch
 ... with_lesion=True \
     lesion_mask_path=/path/to/mask_preprocessed \
     lesion_mask_json=/path/to/ReXGroundingCT/dataset.json
 
-# 冒烟测试（1 卡 / 2 卡各跑 1 个 train+val batch）
+# Smoke test (one train + val batch on 1 or 2 GPUs)
 CUDA_VISIBLE_DEVICES=0 python main_3D.py with task_pretrain_m3ae_3D \
     num_gpus=1 per_gpu_batchsize=2 fast_dev_run=True strategy=auto \
     train_limit=20 val_limit=5
-```
+Common options:
 
-常用开关：
-
-- `resume_from=<ckpt>` 断点续训
-- `test_only=True test_ckpt_path=<ckpt>` 只测试
-- `datamodule=rate_hr`（默认，原始 CT volume，喂 CTViT）/ `rate_hr_fea_qwen`
-  （预提取 Qwen3-VL 特征 80×8×8×2560，需要 feature 版编码器，当前模型不兼容）
-- `with_lesion=True` 打开病灶对齐分支（需要 ReXGroundingCT mask），默认关闭（与原快照一致）
-- `num_expert` / `topk_struct`：查询驱动 token 缩减的结构超参
-- `strategy=auto` 单卡/CPU 调试用；多卡默认 `ddp_find_unused_parameters_true`
-
-### 3.2 Stage-2 VQA 微调
-
-```bash
-# 启动脚本（指定 Stage-1 预训练 ckpt）
+resume_from=<ckpt>: resume training from a checkpoint
+test_only=True test_ckpt_path=<ckpt>: test only
+datamodule=rate_hr (default; raw CT volumes fed to CTViT) / rate_hr_fea_qwen (pre-extracted Qwen3-VL features 80×8×8×2560; requires a feature-based encoder and is not compatible with the current model)
+with_lesion=True: enable the lesion alignment branch (requires ReXGroundingCT masks); off by default (same as the original snapshot)
+num_expert / topk_struct: structural hyperparameters of query-driven token reduction
+strategy=auto: for single-GPU / CPU debugging; multi-GPU defaults to ddp_find_unused_parameters_true
+3.2 Stage-2 VQA finetuning
+# Launch script (pass the Stage-1 pretrained checkpoint)
 PRETRAIN_CKPT=/path/to/stage1_pretrain.ckpt bash run_vqa.sh
 
-# 等价命令
+# Equivalent command
 CUDA_VISIBLE_DEVICES=0 python main_report_gen_vqa.py \
     with task_finetune_vqa \
     num_gpus=1 num_nodes=1 test_only=False \
     pretrain_path=/path/to/stage1_pretrain.ckpt
 
-# 冒烟测试（1 卡 1 batch，strategy=auto）
+# Smoke test (1 GPU, 1 batch, strategy=auto)
 CUDA_VISIBLE_DEVICES=0 python main_report_gen_vqa.py with task_finetune_vqa \
     num_gpus=1 fast_dev_run=True strategy=auto
-```
+Common VQA options:
 
-VQA 常用开关：
+pretrain_path=<ckpt>: load the Stage-1 pretrained encoder (non-strict; strongly recommended)
+test_only=True test_ckpt_path=<vqa_ckpt>: test with a finetuned VQA checkpoint
+decoder_path=/path/to/LLM text_tokenlizer_path=/path/to/LLM llm_dim=<dim>: switch the LLM decoder (default Qwen3-4B / llm_dim=2560, requires transformers>=4.50)
+selected_patch=9: number of tokens kept per organ (strength of query-driven token reduction)
+Frozen modules: the code automatically freezes vision_encoder and expert (the Stage-1 CTViT + query experts)
+4. Citation
+If you use this code, please cite M3D-QAdapter: 3D Medical VQA with Lesion-Level Finding-Segmentation Alignment and Query-Driven Adaptive Token Reduction.
 
-- `pretrain_path=<ckpt>` 加载 Stage-1 预训练编码器（非 strict；强烈建议）
-- `test_only=True test_ckpt_path=<vqa_ckpt>` 用微调后的 VQA ckpt 测试
-- `decoder_path=/path/to/LLM text_tokenlizer_path=/path/to/LLM llm_dim=<dim>` 换 LLM 解码器
-  （默认 Qwen3-4B / `llm_dim=2560`，需 `transformers>=4.50`）
-- `selected_patch=9` 每器官保留的 token 数（查询驱动 token 缩减强度）
-- 冻结项：代码自动冻结 `vision_encoder` 与 `expert`（Stage-1 的 CTViT + query experts）
-
-
-## 8. 引用
-
-> 若使用本代码，请引用 *M3D-QAdapter: 3D Medical VQA with Lesion-Level
-> Finding-Segmentation Alignment and Query-Driven Adaptive Token Reduction*。
-
-```bibtex
 @inproceedings{m3d-qadapter,
   title   = {M3D-QAdapter: 3D Medical VQA with Lesion-Level Finding-Segmentation
              Alignment and Query-Driven Adaptive Token Reduction},
-  author  = {TODO},   % 请按论文正式发表信息补全
+  author  = {TODO},   % fill in from the published version of the paper
   booktitle = {TODO},
   year    = {TODO}
 }
-```
